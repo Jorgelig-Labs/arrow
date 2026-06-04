@@ -43,6 +43,13 @@ function arrowApi() {
         if (session) args.push('--session', session)
         run(args, res)
       })
+      server.middlewares.use('/api/worktrees', (req: IncomingMessage, res: ServerResponse) => {
+        const url = new URL(req.url ?? '', 'http://localhost')
+        // ?sizes=1 includes the slow `du` pass; default is a fast git-only scan.
+        const args = ['--worktrees', '--json']
+        if (url.searchParams.get('sizes') !== '1') args.push('--no-sizes')
+        run(args, res)
+      })
     },
   }
 }

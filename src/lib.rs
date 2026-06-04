@@ -31,6 +31,9 @@ use serde::Serialize;
 use serde_json::Value;
 use walkdir::WalkDir;
 
+pub mod worktree;
+pub use worktree::{CleanupResult, WorktreeAudit};
+
 // ---------------------------------------------------------------------------
 // Modelo interno (acumulación)
 // ---------------------------------------------------------------------------
@@ -65,7 +68,21 @@ pub struct Session {
 #[derive(Default)]
 pub struct Repo {
     pub git_branch: Option<String>,
+    /// Set when this repo's working dir is a git worktree (its `.git` is a FILE
+    /// pointing at `<main>/.git/worktrees/<name>`), so the UI can nest it under
+    /// its parent instead of showing it as a stray repo with a random name.
+    pub worktree: Option<WorktreeInfo>,
     pub sessions: BTreeMap<String, Session>,
+}
+
+/// A git worktree's link to its parent checkout. `parent_repo` is best-effort:
+/// `None` if the `.git` file doesn't follow the usual `<main>/.git/worktrees/<name>`
+/// layout. The worktree's branch lives on [`RepoOut::git_branch`] (not duplicated here).
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeInfo {
+    pub name: String,
+    pub parent_repo: Option<String>,
 }
 
 /// Metadatos por sesión, recogidos de cualquier record con `sessionId`.
@@ -105,6 +122,8 @@ pub struct ReportOut {
 pub struct RepoOut {
     pub cwd: String,
     pub git_branch: Option<String>,
+    /// Present when `cwd` is a git worktree; lets the UI group it under its parent.
+    pub worktree: Option<WorktreeInfo>,
     pub sessions: Vec<SessionOut>,
 }
 
@@ -160,6 +179,29 @@ pub struct ContentOut {
 pub fn build_report(projects_dir: &str) -> ReportOut {
     let collected = collect(projects_dir, None, None);
     build_report_from(projects_dir, &collected.repos, &collected.metas)
+}
+
+/// Worktree hygiene audit (Stage 1): enumerates the worktrees of every repo arrow
+/// knows about and flags which are safe to clean. Lives OUTSIDE the pure transcript
+/// parser — it shells out to live `git`/`du`/`gh` (see [`worktree`]). The set of
+/// repos comes from the report: each repo's parent (if it's a worktree) or its own
+/// root, de-duplicated; `git worktree list` then enumerates ALL their worktrees,
+/// even ones Claude never edited.
+pub fn worktree_audit(projects_dir: &str, include_sizes: bool) -> WorktreeAudit {
+    let report = build_report(projects_dir);
+    let mut seen = std::collections::HashSet::new();
+    let mut roots: Vec<String> = Vec::new();
+    for r in &report.repos {
+        let root = r
+            .worktree
+            .as_ref()
+            .and_then(|w| w.parent_repo.clone())
+            .unwrap_or_else(|| r.cwd.clone());
+        if seen.insert(root.clone()) {
+            roots.push(root);
+        }
+    }
+    worktree::audit_worktrees(&roots, include_sizes)
 }
 
 /// One target edit captured during a session scan: the inline `originalFile`
@@ -559,7 +601,7 @@ pub fn collect(
     // .claude/: un `.claude/` dentro de un repo (settings, skills…) SÍ es tu código.
     let claude_home = format!("{home}/.claude/");
     let mut c = Collected::default();
-    let mut roots: HashMap<String, String> = HashMap::new(); // cache cwd -> raíz git
+    let mut roots: HashMap<String, GitContext> = HashMap::new(); // cache cwd -> contexto git
 
     for entry in WalkDir::new(projects_dir)
         .into_iter()
@@ -617,7 +659,7 @@ fn ingest(
     session_filter: Option<&str>,
     repos: &mut BTreeMap<String, Repo>,
     metas: &mut BTreeMap<String, SessionMeta>,
-    roots: &mut HashMap<String, String>,
+    roots: &mut HashMap<String, GitContext>,
     claude_home: &str,
 ) {
     // --- metadatos: cualquier record con sessionId ---
@@ -681,8 +723,10 @@ fn ingest(
         .map(str::to_string);
 
     // El repo es la raíz git del cwd de la sesión (fusiona subdirectorios como
-    // web/ con su repo). Estable aunque el proyecto no sea git.
-    let repo_key = git_root(&cwd, roots);
+    // web/ con su repo). Estable aunque el proyecto no sea git. Si la raíz es un
+    // worktree, `ctx.worktree` enlaza con su repo padre (la UI lo anida ahí).
+    let ctx = resolve_git_context(&cwd, roots);
+    let repo_key = ctx.root;
 
     if let Some(rf) = repo_filter {
         if !repo_key.contains(rf) {
@@ -698,6 +742,9 @@ fn ingest(
     let repo = repos.entry(repo_key).or_default();
     if repo.git_branch.is_none() {
         repo.git_branch = branch;
+    }
+    if repo.worktree.is_none() {
+        repo.worktree = ctx.worktree;
     }
     let sess = repo.sessions.entry(session).or_default();
     let fc = sess.files.entry(file_path).or_default();
@@ -786,6 +833,7 @@ pub fn build_report_from(
             RepoOut {
                 cwd: cwd.clone(),
                 git_branch: repo.git_branch.clone(),
+                worktree: repo.worktree.clone(),
                 sessions,
             }
         })
@@ -805,26 +853,82 @@ pub fn build_report_from(
     }
 }
 
-/// Resuelve la raíz del repo git que contiene `cwd` (sube buscando `.git`).
-/// Así un cwd que derivó a un subdirectorio (p.ej. .../arrow/web) se agrupa con
-/// su repo (.../arrow). Si no hay `.git`, usa el propio cwd. Cachea por cwd.
-fn git_root(cwd: &str, cache: &mut HashMap<String, String>) -> String {
-    if let Some(r) = cache.get(cwd) {
-        return r.clone();
+/// Git context of a `cwd`: the repo `root` plus, if that root is a worktree,
+/// its [`WorktreeInfo`]. See [`resolve_git_context`].
+#[derive(Clone, Default)]
+struct GitContext {
+    root: String,
+    worktree: Option<WorktreeInfo>,
+}
+
+/// Resuelve la raíz del repo git que contiene `cwd` (sube buscando `.git`) y, si
+/// esa raíz es un worktree, su info de padre. Así un cwd en un subdirectorio
+/// (p.ej. .../arrow/web) se agrupa con su repo (.../arrow). Si no hay `.git`, usa
+/// el propio cwd. Cachea por cwd.
+///
+/// Worktree vs repo normal: en un repo, `.git` es un DIRECTORIO; en un worktree,
+/// `.git` es un ARCHIVO con `gitdir: <main>/.git/worktrees/<name>`. Distinguimos
+/// por `metadata().is_file()` y, para un worktree, derivamos `name` (último
+/// componente del gitdir) y `parent_repo` (lo previo a `/.git/worktrees/`).
+fn resolve_git_context(cwd: &str, cache: &mut HashMap<String, GitContext>) -> GitContext {
+    if let Some(c) = cache.get(cwd) {
+        return c.clone();
     }
     let mut dir = PathBuf::from(cwd);
-    let mut root = cwd.to_string();
+    let mut ctx = GitContext {
+        root: cwd.to_string(),
+        worktree: None,
+    };
     loop {
-        if dir.join(".git").exists() {
-            root = dir.to_string_lossy().into_owned();
+        let dotgit = dir.join(".git");
+        if dotgit.exists() {
+            ctx.root = dir.to_string_lossy().into_owned();
+            // `.git` is a FILE only in a worktree (and in submodules); a normal
+            // repo has a `.git` DIRECTORY. Best-effort parse; on any failure we
+            // simply leave `worktree = None` (treated as a normal repo).
+            if std::fs::metadata(&dotgit)
+                .map(|m| m.is_file())
+                .unwrap_or(false)
+            {
+                ctx.worktree = parse_worktree_link(&dotgit);
+            }
             break;
         }
         if !dir.pop() {
             break;
         }
     }
-    cache.insert(cwd.to_string(), root.clone());
-    root
+    cache.insert(cwd.to_string(), ctx.clone());
+    ctx
+}
+
+/// Reads a `.git` FILE and, IF it links a git worktree
+/// (`gitdir: <main-git-dir>/worktrees/<name>`), derives its [`WorktreeInfo`].
+/// Returns `None` for anything else — notably git SUBMODULES, whose `.git` is
+/// also a file but points at `.git/modules/<name>` (those are normal repos, not
+/// worktrees). `name` = the segment after `worktrees/`; `parent_repo` = the part
+/// before `/.git/worktrees/` (best-effort, `None` if the main repo is bare).
+fn parse_worktree_link(dotgit_file: &Path) -> Option<WorktreeInfo> {
+    let content = std::fs::read_to_string(dotgit_file).ok()?;
+    let gitdir = content
+        .lines()
+        .find_map(|l| l.strip_prefix("gitdir:"))
+        .map(str::trim)?;
+    // The `/worktrees/` segment is what distinguishes a worktree link from a
+    // submodule link (`/modules/`). No segment -> not a worktree.
+    let idx = gitdir.find("/worktrees/")?;
+    let after = &gitdir[idx + "/worktrees/".len()..];
+    let name = after
+        .split('/')
+        .next()
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    // `<main>/.git/worktrees/<name>` -> parent_repo = `<main>` (strip the `/.git`
+    // git-dir suffix; `None` if the main repo is bare and has no `/.git` segment).
+    let parent_repo = gitdir[..idx]
+        .strip_suffix("/.git")
+        .map(|main| main.to_string());
+    Some(WorktreeInfo { name, parent_repo })
 }
 
 // ---------------------------------------------------------------------------
@@ -977,6 +1081,98 @@ mod tests {
             keys[0],
             &repo.to_string_lossy(),
             "el cwd en web/ debe agruparse bajo la raíz git myrepo"
+        );
+    }
+
+    #[test]
+    fn detecta_worktree_y_su_repo_padre() {
+        let dir = tmpdir("worktree");
+        // Repo principal: `.git` es un DIRECTORIO.
+        let main = dir.join("myrepo");
+        fs::create_dir_all(main.join(".git").join("worktrees").join("feature-x")).unwrap();
+        // Worktree: `.git` es un ARCHIVO con `gitdir: <main>/.git/worktrees/feature-x`.
+        let wt = dir.join("myrepo-wt");
+        fs::create_dir_all(&wt).unwrap();
+        let gitdir = main.join(".git").join("worktrees").join("feature-x");
+        fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", gitdir.to_string_lossy()),
+        )
+        .unwrap();
+        let file = wt.join("a.txt");
+        fs::write(&file, "x\n").unwrap();
+        let rec = edit_record(
+            "s1",
+            wt.to_str().unwrap(),
+            file.to_str().unwrap(),
+            "2026-01-01T00:00:00Z",
+            "",
+            &["+x"],
+        );
+        write_top_level(&dir, "proj", "s1", &[rec]);
+
+        let report = build_report(dir.to_str().unwrap());
+        assert_eq!(report.repos.len(), 1);
+        let repo = &report.repos[0];
+        // El worktree es su propia entrada de repo (root = el dir del worktree)...
+        assert_eq!(repo.cwd, wt.to_string_lossy());
+        // ...pero lleva su info de worktree para que la UI lo anide bajo el padre.
+        let info = repo.worktree.as_ref().expect("debe detectarse el worktree");
+        assert_eq!(info.name, "feature-x");
+        assert_eq!(
+            info.parent_repo.as_deref(),
+            Some(main.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn submodulo_no_se_confunde_con_worktree() {
+        // Un submódulo también tiene `.git` como ARCHIVO, pero apunta a
+        // `.git/modules/<name>` (no `worktrees/`). NO debe marcarse worktree.
+        let dir = tmpdir("submodule");
+        let sub = dir.join("parent").join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join(".git"), "gitdir: ../.git/modules/sub\n").unwrap();
+        let file = sub.join("a.txt");
+        fs::write(&file, "x\n").unwrap();
+        let rec = edit_record(
+            "s1",
+            sub.to_str().unwrap(),
+            file.to_str().unwrap(),
+            "2026-01-01T00:00:00Z",
+            "",
+            &["+x"],
+        );
+        write_top_level(&dir, "proj", "s1", &[rec]);
+
+        let report = build_report(dir.to_str().unwrap());
+        assert!(
+            report.repos[0].worktree.is_none(),
+            "un submódulo (gitdir .git/modules/…) no es un worktree"
+        );
+    }
+
+    #[test]
+    fn repo_normal_no_marca_worktree() {
+        let dir = tmpdir("notworktree");
+        let repo = dir.join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let file = repo.join("a.txt");
+        fs::write(&file, "x\n").unwrap();
+        let rec = edit_record(
+            "s1",
+            repo.to_str().unwrap(),
+            file.to_str().unwrap(),
+            "2026-01-01T00:00:00Z",
+            "",
+            &["+x"],
+        );
+        write_top_level(&dir, "proj", "s1", &[rec]);
+
+        let report = build_report(dir.to_str().unwrap());
+        assert!(
+            report.repos[0].worktree.is_none(),
+            "un `.git` directorio es un repo normal, no un worktree"
         );
     }
 

@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { Report, Repo, Session } from '../lib/types'
   import { isLive, focusRepos as focusReposOf, relative, dateBucket, BUCKET_ORDER } from '../lib/time'
+  import { groupRepos, type RepoNode } from '../lib/worktrees'
 
   interface Props {
     report: Report
@@ -10,27 +11,43 @@
   }
   let { report, selected, now, onSelect }: Props = $props()
 
-  // Foco: los repos de la sesión activa (la de actividad más reciente) + cualquiera tocado
-  // en la misma ráfaga (~10 min). El resto va a "Other repos". Lógica única en time.ts.
-  let focusRepos = $derived(focusReposOf(report.repos))
-  let otherRepos = $derived(report.repos.filter((r) => !focusRepos.includes(r)))
+  // Nodos: cada git worktree se anida bajo su repo padre (groupRepos); un repo normal
+  // es un nodo hoja. Foco: reusa focusRepos (a nivel de repo) y marca en foco el nodo
+  // si CUALQUIER miembro (padre o worktree) está en el foco. El resto va a "Other repos".
+  let nodes = $derived(groupRepos(report.repos))
+  let focusSet = $derived(new Set(focusReposOf(report.repos).map((r) => r.cwd)))
+  let focusNodes = $derived(nodes.filter((n) => n.repos.some((r) => focusSet.has(r.cwd))))
+  let otherNodes = $derived(nodes.filter((n) => !focusNodes.includes(n)))
 
+  // Estado de expansión (una sola tabla, indexada por node.key y por cwd de cada miembro:
+  // como key de grupo = parentCwd y los worktrees tienen cwd propio, no hay colisión).
   function focusDefaults() {
     const o: Record<string, boolean> = {}
-    for (const r of focusReposOf(report.repos)) o[r.cwd] = true
+    const fset = new Set(focusReposOf(report.repos).map((r) => r.cwd))
+    for (const n of groupRepos(report.repos)) {
+      if (!n.repos.some((r) => fset.has(r.cwd))) continue
+      o[n.key] = true
+      // Auto-expande el miembro activo (p.ej. el worktree de la sesión activa).
+      for (const r of n.repos) if (fset.has(r.cwd)) o[r.cwd] = true
+    }
     return o
   }
   let openRepos = $state<Record<string, boolean>>(focusDefaults())
 
-  // Tras un refresco, auto-expandir los repos del foco nuevos sin pisar los toggles del usuario.
+  // Tras un refresco, auto-expandir los nodos del foco nuevos sin pisar los toggles del usuario.
   $effect(() => {
-    const fset = new Set(focusReposOf(report.repos).map((r) => r.cwd))
     let changed = false
     const next = { ...openRepos }
-    for (const r of report.repos) {
-      if (fset.has(r.cwd) && !(r.cwd in next)) {
-        next[r.cwd] = true
+    for (const n of focusNodes) {
+      if (!(n.key in next)) {
+        next[n.key] = true
         changed = true
+      }
+      for (const r of n.repos) {
+        if (focusSet.has(r.cwd) && !(r.cwd in next)) {
+          next[r.cwd] = true
+          changed = true
+        }
       }
     }
     if (changed) openRepos = next
@@ -72,6 +89,10 @@
   function toggle(o: Record<string, boolean>, k: string): Record<string, boolean> {
     return { ...o, [k]: !o[k] }
   }
+  // Punto verde: solo si el nodo está en foco y el repo tiene actividad reciente.
+  function repoLive(repo: Repo | null, inFocus: boolean): boolean {
+    return inFocus && isLive(repo?.sessions[0]?.lastActivity, now)
+  }
 </script>
 
 {#snippet fileRow(sessionId: string, f: any, deep: boolean, root: string)}
@@ -94,81 +115,132 @@
   </button>
 {/snippet}
 
-{#snippet repoRow(repo: Repo, inFocus: boolean)}
+<!-- Cuerpo de un repo (sesión actual + historial). Reutilizado por nodos hoja y por
+     cada worktree hijo: un worktree ES un repo con sus propias sesiones/archivos. -->
+{#snippet repoBody(repo: Repo)}
   {@const current = repo.sessions[0]}
   {@const rest = repo.sessions.slice(1)}
-  <!-- Punto verde: solo en repos del foco que además tienen actividad reciente (no glow falso si es viejo). -->
-  {@const live = inFocus && isLive(current?.lastActivity, now)}
-  <div class="repo">
-    <button class="row repo-head" onclick={() => (openRepos = toggle(openRepos, repo.cwd))} title={repo.cwd}>
-      <span class="chev">{openRepos[repo.cwd] ? '▾' : '▸'}</span>
-      {#if live}<span class="dot"></span>{/if}
-      <span class="repo-name">{basename(repo.cwd)}</span>
-      {#if repo.gitBranch}<span class="branch">{repo.gitBranch}</span>{/if}
+  {#if current}
+    <div class="current-head">
+      <span class="stitle" title={titleOf(current)}>{titleOf(current)}</span>
+      <span class="time">{relative(current.lastActivity, now)}</span>
+    </div>
+    {#each current.files as f}
+      {@render fileRow(current.sessionId, f, false, repo.cwd)}
+    {/each}
+  {/if}
+
+  {#if rest.length}
+    <button class="row hist-head" onclick={() => (openHist = toggle(openHist, repo.cwd))}>
+      <span class="chev">{openHist[repo.cwd] ? '▾' : '▸'}</span>
+      <span class="hist-label">History</span>
+      <span class="count">{rest.length}</span>
     </button>
-
-    {#if openRepos[repo.cwd]}
-      {#if current}
-        <div class="current-head">
-          <span class="stitle" title={titleOf(current)}>{titleOf(current)}</span>
-          <span class="time">{relative(current.lastActivity, now)}</span>
-        </div>
-        {#each current.files as f}
-          {@render fileRow(current.sessionId, f, false, repo.cwd)}
-        {/each}
-      {/if}
-
-      {#if rest.length}
-        <button class="row hist-head" onclick={() => (openHist = toggle(openHist, repo.cwd))}>
-          <span class="chev">{openHist[repo.cwd] ? '▾' : '▸'}</span>
-          <span class="hist-label">History</span>
-          <span class="count">{rest.length}</span>
+    {#if openHist[repo.cwd]}
+      {#each buckets(rest) as grp}
+        {@const bkey = repo.cwd + '::' + grp.bucket}
+        <button class="row bucket-head" onclick={() => (openBucket = toggle(openBucket, bkey))}>
+          <span class="chev">{openBucket[bkey] ? '▾' : '▸'}</span>
+          <span class="bucket-label">{grp.bucket}</span>
+          <span class="count">{grp.sessions.length}</span>
         </button>
-        {#if openHist[repo.cwd]}
-          {#each buckets(rest) as grp}
-            {@const bkey = repo.cwd + '::' + grp.bucket}
-            <button class="row bucket-head" onclick={() => (openBucket = toggle(openBucket, bkey))}>
-              <span class="chev">{openBucket[bkey] ? '▾' : '▸'}</span>
-              <span class="bucket-label">{grp.bucket}</span>
-              <span class="count">{grp.sessions.length}</span>
+        {#if openBucket[bkey]}
+          {#each grp.sessions as s}
+            {@const skey = repo.cwd + '::' + s.sessionId}
+            <button class="row hist-session" onclick={() => (openSess = toggle(openSess, skey))} title={titleOf(s)}>
+              <span class="chev">{openSess[skey] ? '▾' : '▸'}</span>
+              <span class="stitle small">{titleOf(s)}</span>
+              <span class="time">{relative(s.lastActivity, now)}</span>
             </button>
-            {#if openBucket[bkey]}
-              {#each grp.sessions as s}
-                {@const skey = repo.cwd + '::' + s.sessionId}
-                <button class="row hist-session" onclick={() => (openSess = toggle(openSess, skey))} title={titleOf(s)}>
-                  <span class="chev">{openSess[skey] ? '▾' : '▸'}</span>
-                  <span class="stitle small">{titleOf(s)}</span>
-                  <span class="time">{relative(s.lastActivity, now)}</span>
-                </button>
-                {#if openSess[skey]}
-                  {#each s.files as f}
-                    {@render fileRow(s.sessionId, f, true, repo.cwd)}
-                  {/each}
-                {/if}
+            {#if openSess[skey]}
+              {#each s.files as f}
+                {@render fileRow(s.sessionId, f, true, repo.cwd)}
               {/each}
             {/if}
           {/each}
         {/if}
-      {/if}
+      {/each}
+    {/if}
+  {/if}
+{/snippet}
+
+<!-- Nodo hoja: un repo normal (sin worktrees). Igual que antes. -->
+{#snippet leafNode(repo: Repo, inFocus: boolean)}
+  <div class="repo">
+    <button class="row repo-head" onclick={() => (openRepos = toggle(openRepos, repo.cwd))} title={repo.cwd}>
+      <span class="chev">{openRepos[repo.cwd] ? '▾' : '▸'}</span>
+      {#if repoLive(repo, inFocus)}<span class="dot"></span>{/if}
+      <span class="repo-name">{basename(repo.cwd)}</span>
+      {#if repo.gitBranch}<span class="branch">{repo.gitBranch}</span>{/if}
+    </button>
+    {#if openRepos[repo.cwd]}
+      {@render repoBody(repo)}
     {/if}
   </div>
 {/snippet}
 
+<!-- Worktree hijo: anidado bajo el padre, etiquetado con su nombre + rama. -->
+{#snippet worktreeChild(repo: Repo, inFocus: boolean)}
+  {@const label = repo.worktree?.name ?? basename(repo.cwd)}
+  <div class="repo wt-child">
+    <button class="row wt-head" onclick={() => (openRepos = toggle(openRepos, repo.cwd))} title={repo.cwd}>
+      <span class="chev">{openRepos[repo.cwd] ? '▾' : '▸'}</span>
+      {#if repoLive(repo, inFocus)}<span class="dot"></span>{/if}
+      <span class="wt-tag" title="git worktree">wt</span>
+      <span class="wt-name">{label}</span>
+      {#if repo.gitBranch}<span class="branch">{repo.gitBranch}</span>{/if}
+    </button>
+    {#if openRepos[repo.cwd]}
+      {@render repoBody(repo)}
+    {/if}
+  </div>
+{/snippet}
+
+<!-- Nodo grupo: un repo padre con ≥1 worktree. Cabecera = nombre del padre + nº de
+     worktrees; cuerpo = (sesiones propias del checkout principal, si las hay) + hijos. -->
+{#snippet groupNode(node: RepoNode, inFocus: boolean)}
+  {@const anyLive = inFocus && node.repos.some((r) => isLive(r.sessions[0]?.lastActivity, now))}
+  <div class="repo">
+    <button class="row repo-head" onclick={() => (openRepos = toggle(openRepos, node.key))} title={node.displayCwd}>
+      <span class="chev">{openRepos[node.key] ? '▾' : '▸'}</span>
+      {#if anyLive}<span class="dot"></span>{/if}
+      <span class="repo-name">{basename(node.displayCwd)}</span>
+      <span class="wt-count" title="git worktrees">{node.worktrees.length} wt</span>
+    </button>
+    {#if openRepos[node.key]}
+      {#if node.parent}
+        {@render repoBody(node.parent)}
+      {/if}
+      {#each node.worktrees as wt}
+        {@render worktreeChild(wt, inFocus)}
+      {/each}
+    {/if}
+  </div>
+{/snippet}
+
+{#snippet repoNode(node: RepoNode, inFocus: boolean)}
+  {#if node.worktrees.length === 0 && node.parent}
+    {@render leafNode(node.parent, inFocus)}
+  {:else}
+    {@render groupNode(node, inFocus)}
+  {/if}
+{/snippet}
+
 <nav class="tree">
-  {#each focusRepos as repo}
-    {@render repoRow(repo, true)}
+  {#each focusNodes as node (node.key)}
+    {@render repoNode(node, true)}
   {/each}
 
-  {#if otherRepos.length}
+  {#if otherNodes.length}
     <button class="row others-head" onclick={() => (openOthers = !openOthers)}>
       <span class="chev">{openOthers ? '▾' : '▸'}</span>
       <span class="others-label">Other repos</span>
-      <span class="count">{otherRepos.length}</span>
+      <span class="count">{otherNodes.length}</span>
     </button>
     {#if openOthers}
       <div class="others">
-        {#each otherRepos as repo}
-          {@render repoRow(repo, false)}
+        {#each otherNodes as node (node.key)}
+          {@render repoNode(node, false)}
         {/each}
       </div>
     {/if}
@@ -229,6 +301,40 @@
     overflow: hidden;
     text-overflow: ellipsis;
     flex: none;
+  }
+  /* Cuenta de worktrees en la cabecera del grupo. */
+  .wt-count {
+    margin-left: auto;
+    font-size: 10px;
+    color: var(--dim);
+    background: var(--chip);
+    padding: 1px 6px;
+    border-radius: 999px;
+    white-space: nowrap;
+    flex: none;
+  }
+  /* Worktree hijo: indentado bajo el padre. */
+  .wt-child {
+    margin-left: 14px;
+    border-left: 1px solid var(--border);
+  }
+  .wt-head {
+    padding-left: 8px;
+  }
+  .wt-tag {
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    color: var(--dim);
+    background: var(--chip);
+    padding: 0 4px;
+    border-radius: 3px;
+    flex: none;
+  }
+  .wt-name {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .current-head {
     display: flex;

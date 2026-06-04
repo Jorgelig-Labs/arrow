@@ -10,7 +10,7 @@
 use anyhow::Result;
 use clap::Parser;
 
-use arrow::{Collected, Repo, SessionMeta};
+use arrow::{Collected, Repo, SessionMeta, WorktreeAudit};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -46,6 +46,17 @@ struct Cli {
     /// Ruta exacta del archivo (para --content)
     #[arg(long)]
     file: Option<String>,
+
+    /// Auditoría de worktrees: candidatos a limpieza (mergeados/fantasmas) + tamaño.
+    /// Usa git/du en vivo (capa opt-in, fuera del parser de transcripts). Con --json
+    /// emite el contrato WorktreeAudit.
+    #[arg(long)]
+    worktrees: bool,
+
+    /// Con --worktrees: omite el cálculo de tamaño en disco (`du`), el paso lento.
+    /// Escaneo rápido solo-git (los tamaños salen como desconocidos).
+    #[arg(long)]
+    no_sizes: bool,
 }
 
 const RESET: &str = "\x1b[0m";
@@ -71,6 +82,16 @@ fn main() -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("--content requiere --file <ruta>"))?;
         let out = arrow::file_content(&projects_dir, target, cli.session.as_deref());
         println!("{}", serde_json::to_string(&out)?);
+        return Ok(());
+    }
+
+    if cli.worktrees {
+        let audit = arrow::worktree_audit(&projects_dir, !cli.no_sizes);
+        if cli.json {
+            println!("{}", serde_json::to_string_pretty(&audit)?);
+        } else {
+            render_worktrees(&audit);
+        }
         return Ok(());
     }
 
@@ -107,6 +128,90 @@ fn render_terminal(projects_dir: &str, collected: &Collected, list_only: bool) {
 
     for (cwd, repo) in repos {
         render_repo(cwd, repo, metas, list_only);
+    }
+}
+
+/// Human-readable size from KB (du -sk units): KB / MB / GB.
+fn human_kb(kb: u64) -> String {
+    if kb >= 1024 * 1024 {
+        format!("{:.1} GB", kb as f64 / (1024.0 * 1024.0))
+    } else if kb >= 1024 {
+        format!("{:.0} MB", kb as f64 / 1024.0)
+    } else {
+        format!("{kb} KB")
+    }
+}
+
+fn render_worktrees(audit: &WorktreeAudit) {
+    println!("{BOLD}arrow{RESET} {DIM}· worktree audit{RESET}");
+    if audit.repos.is_empty() {
+        println!("\n{YELLOW}Sin worktrees en los repos auditados.{RESET}");
+        return;
+    }
+    // Sizes are optional (fast scan skips `du`); detect whether any were measured so
+    // we don't print a dishonest "0 KB" when sizes simply weren't computed.
+    let measured = audit
+        .repos
+        .iter()
+        .any(|r| r.worktrees.iter().any(|w| w.size_kb.is_some()));
+    // `gh_available` is only meaningful on a full scan (the fast scan skips gh on purpose).
+    if measured && !audit.gh_available {
+        println!("{DIM}gh no autenticado: detección de PR-merged omitida (best-effort){RESET}");
+    }
+    let mut grand_total = 0u64;
+    let mut grand_reclaim = 0u64;
+    for repo in &audit.repos {
+        grand_total += repo.total_kb;
+        grand_reclaim += repo.reclaimable_kb;
+        let reclaimable_n = repo.worktrees.iter().filter(|w| w.reclaimable).count();
+        let def = repo.default_branch.as_deref().unwrap_or("—");
+        let size_part = if measured {
+            format!(
+                " · {} · {GREEN}{} reclaimable{RESET}",
+                human_kb(repo.total_kb),
+                human_kb(repo.reclaimable_kb)
+            )
+        } else {
+            format!(" · {GREEN}{reclaimable_n} reclaimable{RESET}")
+        };
+        println!(
+            "\n{CYAN}{BOLD}{}{RESET} {DIM}[default: {def}] · {} worktrees{}",
+            repo.parent_repo,
+            repo.worktrees.len(),
+            size_part,
+        );
+        for wt in &repo.worktrees {
+            let mark = if wt.reclaimable {
+                format!("{GREEN}●{RESET}")
+            } else if wt.stale {
+                format!("{YELLOW}●{RESET}")
+            } else {
+                format!("{DIM}○{RESET}")
+            };
+            let branch = wt.branch.as_deref().unwrap_or("(detached)");
+            let size = wt.size_kb.map(human_kb).unwrap_or_else(|| "—".into());
+            let reasons = if wt.reasons.is_empty() {
+                String::new()
+            } else {
+                format!("  {DIM}({}){RESET}", wt.reasons.join(", "))
+            };
+            println!(
+                "  {mark} {BOLD}{}{RESET} {DIM}{branch}{RESET}  {size}{reasons}",
+                wt.name
+            );
+            if wt.reclaimable {
+                println!("      {DIM}$ {}{RESET}", wt.command);
+            }
+        }
+    }
+    if measured {
+        println!(
+            "\n{BOLD}Total:{RESET} {} en worktrees · {GREEN}{} reclaimable{RESET} {DIM}(merged/on-default/PR-merged/prunable){RESET}",
+            human_kb(grand_total),
+            human_kb(grand_reclaim),
+        );
+    } else {
+        println!("\n{DIM}(tamaños no medidos: usa sin --no-sizes para el `du`){RESET}");
     }
 }
 

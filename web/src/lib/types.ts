@@ -9,7 +9,13 @@ export interface Report {
 export interface Repo {
   cwd: string
   gitBranch: string | null
+  worktree?: WorktreeInfo | null // presente si cwd es un git worktree; la UI lo anida bajo su padre
   sessions: Session[] // ordenadas por última actividad (más reciente primero)
+}
+
+export interface WorktreeInfo {
+  name: string // nombre del worktree (último componente del gitdir)
+  parentRepo: string | null // ruta del repo padre; null si el layout no es el canónico
 }
 
 export interface Session {
@@ -41,4 +47,43 @@ export interface FileContent {
   afterAvailable: boolean
   userModified: boolean
   ops: number
+}
+
+// Contrato de `arrow --worktrees --json` (auditoría de higiene de worktrees, Etapa 1).
+export interface WorktreeAudit {
+  repos: WorktreeRepoAudit[]
+  ghAvailable: boolean // gh autenticado -> se intentó detección de PR-merged
+}
+
+export interface WorktreeRepoAudit {
+  parentRepo: string
+  defaultBranch: string | null
+  worktrees: WorktreeEntry[]
+  totalKb: number
+  reclaimableKb: number // solo lo claramente seguro (merged/on-default/PR-merged/prunable)
+}
+
+export interface WorktreeEntry {
+  path: string
+  name: string
+  branch: string | null
+  lastCommit: string | null // ISO 8601
+  ageDays: number | null
+  merged: boolean // ancestro de la rama default (chequeo local)
+  onDefault: boolean // está en la rama default
+  prMerged: boolean | null // gh: PR mergeado para esta rama (best-effort)
+  prunable: boolean // git lo marca (su directorio ya no existe)
+  stale: boolean // ageDays > umbral
+  sizeKb: number | null
+  reasons: string[] // por qué se lista (honesto)
+  reclaimable: boolean // hay una razón claramente segura (no mera antigüedad)
+  command: string // comando exacto para eliminarlo/podarlo
+}
+
+// Resultado de una acción de limpieza (Etapa 2). Espeja arrow::CleanupResult.
+export interface CleanupResult {
+  ok: boolean
+  dryRun: boolean
+  command: string
+  output: string // lo que dijo git (stdout+stderr)
 }

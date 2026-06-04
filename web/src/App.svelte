@@ -4,6 +4,7 @@
   import DiffView from './components/DiffView.svelte'
   import ThemeMenu from './components/ThemeMenu.svelte'
   import WindowControls from './components/WindowControls.svelte'
+  import WorktreesPanel from './components/WorktreesPanel.svelte'
   import { listen } from '@tauri-apps/api/event'
   import { loadReport, loadContent, clearContentCache, inTauri } from './lib/api'
   import { loadZoom, applyZoom, clampZoom, ZOOM_STEP } from './lib/zoom'
@@ -20,6 +21,7 @@
   let diffView = $state<{ openSearch: () => void }>()
   let selected = $state<{ session: string; path: string } | null>(null)
   let theme = $state(localStorage.getItem('arrow.theme') ?? DEFAULT_THEME)
+  let showWorktrees = $state(false) // panel de higiene de worktrees (bajo demanda)
 
   // Reloj independiente: un tick periódico (ver onMount) reasigna `now` para que el
   // tiempo relativo ("Nm ago") y el punto verde envejezcan/caduquen aunque el report no
@@ -245,6 +247,19 @@
     <div class="actions">
       {#if liveCount > 0}<span class="live">● {liveCount}</span>{/if}
       {#if report}<span class="repos">{report.repoCount} repos</span>{/if}
+      <button
+        class="wt-btn"
+        onclick={() => (showWorktrees = true)}
+        title="Find merged / stale / phantom worktrees and clean them up"
+      >
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <path d="M8 1.5v4M8 5.5 4 8.5M8 5.5l4 3M4 8.5v3M12 8.5v3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+          <circle cx="8" cy="2" r="1.4" fill="currentColor" />
+          <circle cx="4" cy="12.4" r="1.4" fill="currentColor" />
+          <circle cx="12" cy="12.4" r="1.4" fill="currentColor" />
+        </svg>
+        <span>Worktrees</span>
+      </button>
       <div class="zoom">
         <button class="zbtn" onclick={() => setZoom(zoomFactor - ZOOM_STEP)} title="Zoom out (Ctrl −)" aria-label="Zoom out">−</button>
         <button class="zpct" onclick={() => setZoom(1)} title="Reset zoom (Ctrl 0)" aria-label="Reset zoom">{zoomPct}%</button>
@@ -296,6 +311,10 @@
       </div>
     </main>
   </div>
+
+  {#if showWorktrees}
+    <WorktreesPanel onClose={() => (showWorktrees = false)} />
+  {/if}
 </div>
 
 <style>
@@ -355,6 +374,24 @@
   }
   .repos {
     color: var(--dim);
+  }
+  .wt-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 24px;
+    padding: 0 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--chip);
+    color: var(--dim);
+    cursor: pointer;
+    font: inherit;
+    font-size: 12px;
+  }
+  .wt-btn:hover {
+    background: var(--hover);
+    color: var(--fg);
   }
   .zoom {
     display: inline-flex;

@@ -13,11 +13,11 @@ use std::path::Path;
 use std::sync::mpsc::{channel, RecvTimeoutError};
 use std::time::Duration;
 
-use arrow::{ContentOut, ReportOut};
+use arrow::{CleanupResult, ContentOut, ReportOut, WorktreeAudit};
 use notify::{RecursiveMode, Watcher};
-use tauri::{AppHandle, Emitter};
 #[cfg(target_os = "macos")]
 use tauri::Manager;
+use tauri::{AppHandle, Emitter};
 
 /// `~/.claude/projects` (fuente de verdad nativa de Claude Code).
 fn projects_dir() -> String {
@@ -35,6 +35,67 @@ fn report() -> ReportOut {
 #[tauri::command]
 fn content(file: String, session: Option<String>) -> ContentOut {
     arrow::file_content(&projects_dir(), &file, session.as_deref())
+}
+
+/// Worktree hygiene audit (Stage 1, read-only). Idéntico a `--worktrees --json`.
+/// Usa git/du/gh en vivo; puede tardar segundos en repos con worktrees grandes,
+/// así que la UI lo dispara bajo demanda (no en cada refresco del report).
+#[tauri::command]
+async fn worktrees(include_sizes: bool) -> WorktreeAudit {
+    // Off the main thread: the audit blocks on git/du subprocesses. `include_sizes`
+    // false = fast git-only scan (no multi-GB `du`), so opening the panel never hangs.
+    tauri::async_runtime::spawn_blocking(move || arrow::worktree_audit(&projects_dir(), include_sizes))
+        .await
+        .unwrap_or(WorktreeAudit {
+            repos: Vec::new(),
+            gh_available: false,
+        })
+}
+
+/// Stage 2 (mutating): remove a worktree via `git worktree remove` (no `--force`).
+/// `dry_run` reports the command without touching disk. On a real success, emits
+/// `report-changed` so the tree refreshes.
+#[tauri::command]
+async fn remove_worktree(
+    app: AppHandle,
+    repo: String,
+    path: String,
+    dry_run: bool,
+) -> CleanupResult {
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        arrow::worktree::remove_worktree(&repo, &path, dry_run)
+    })
+    .await
+    .unwrap_or(CleanupResult {
+        ok: false,
+        dry_run,
+        command: String::new(),
+        output: "internal error running the cleanup task".to_string(),
+    });
+    if res.ok && !res.dry_run {
+        let _ = app.emit("report-changed", ());
+    }
+    res
+}
+
+/// Stage 2 (mutating): prune phantom worktree entries via `git worktree prune`.
+/// `dry_run` uses git's native `-n` preview. On a real success, emits `report-changed`.
+#[tauri::command]
+async fn prune_worktrees(app: AppHandle, repo: String, dry_run: bool) -> CleanupResult {
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        arrow::worktree::prune_worktrees(&repo, dry_run)
+    })
+    .await
+    .unwrap_or(CleanupResult {
+        ok: false,
+        dry_run,
+        command: String::new(),
+        output: "internal error running the prune task".to_string(),
+    });
+    if res.ok && !res.dry_run {
+        let _ = app.emit("report-changed", ());
+    }
+    res
 }
 
 /// Watcher nativo: vigila `~/.claude/projects` y, con debounce, emite
@@ -116,7 +177,13 @@ pub fn run() {
     }
 
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![report, content])
+        .invoke_handler(tauri::generate_handler![
+            report,
+            content,
+            worktrees,
+            remove_worktree,
+            prune_worktrees
+        ])
         .setup(|app| {
             spawn_watcher(app.handle().clone());
             // macOS: restaurar la decoración nativa (semáforos rojo/amarillo/verde). En

@@ -16,7 +16,7 @@ opening an IDE, without AI chat, and **without depending on git or hooks**.
 > Status: **Phase 2 complete + polish — released on Linux
 > ([v0.1.3](https://github.com/MrArcher23/arrow/releases/latest))**. A desktop app (Tauri 2.x) with
 > the Rust parser as its native backend, **already usable day to day** on Linux (`.deb` + AppImage).
-> Phases 0 (parser/CLI), 1 (web UI) and 2 (packaging) are complete; since then: 19 parser tests, a
+> Phases 0 (parser/CLI), 1 (web UI) and 2 (packaging) are complete; since then: 23 parser tests, a
 > resilient watcher, zoom, a custom titlebar, active-session focus, live diff-panel refresh, files
 > ordered by most-recent edit (with relative times that age in place via a clock tick), macOS
 > adaptation, and a robust diff-"before" reconstruction (shows a real diff even on Claude Code's
@@ -130,11 +130,24 @@ cargo build --release
 
 # Normalized JSON (the contract the UI consumes)
 ./target/release/arrow --repo my-project --json
+
+# Worktree hygiene: which worktrees are safe to clean (merged / on-default / merged-PR
+# / prunable), their size, and the exact command. Read-only; add --json for the contract.
+./target/release/arrow --worktrees
 ```
 
 Options: `--projects-dir <path>` (defaults to `~/.claude/projects`), `--repo`, `--session`,
-`--list`, `--json`, and `--content --file <path> [--session <id>]` (emits `{before, after}` for a
-file, for the UI's diff view).
+`--list`, `--json`, `--content --file <path> [--session <id>]` (emits `{before, after}` for a
+file, for the UI's diff view), and `--worktrees` (worktree hygiene audit).
+
+> **Worktrees.** A git worktree is grouped under its parent repo in the UI (instead of showing up
+> as a stray repo with a random name), and the **worktree cleanup** panel lists which ones are safe
+> to remove. This is a **secondary, opt-in git layer**: unlike the transcript parser (which never
+> touches git), it shells out to `git`/`du`/`gh` on demand. "Reclaimable" is honest — it means git
+> says the branch is merged into the default branch, the worktree is on the default branch, a PR was
+> merged, or the entry is a prunable phantom — **never mere staleness**. Removal runs `git worktree
+> remove` **without `--force`** (git refuses on uncommitted/untracked changes), behind a dry-run +
+> confirmation; in the browser dev build it only shows the command to copy.
 
 ## Web UI (Phase 1)
 
@@ -200,11 +213,12 @@ cargo tauri build
 The parser lives in a **library** (`src/lib.rs`): pure functions `build_report(projects_dir)` and
 `file_content(projects_dir, file, session)` + the serializable structs. Two frontends consume it:
 `src/main.rs` (the CLI, with flags intact) and `src-tauri/` (the desktop backend). Zero duplicated
-logic; the same source of truth for terminal, web, and native app. The parser ships **19 unit tests**
+logic; the same source of truth for terminal, web, and native app. The parser ships **23 unit tests**
 (`cargo test`) over fixture transcripts in a tempdir, covering the non-obvious parts: defensive
 parsing, top-level transcripts only, grouping by git root, `+/−` counting, filtering of
-`~/.claude/`, recency ordering (repos, sessions, and files within a session), and the diff-"before" reconstruction cascade (inline `originalFile`,
-reverse-applied patches, full-`Read` snapshot, create → new file, and drift → honestly unavailable).
+`~/.claude/`, recency ordering (repos, sessions, and files within a session), the diff-"before" reconstruction cascade (inline `originalFile`,
+reverse-applied patches, full-`Read` snapshot, create → new file, and drift → honestly unavailable),
+and worktree detection (worktree vs submodule vs plain repo, plus a real `git worktree remove`).
 
 ## Roadmap
 

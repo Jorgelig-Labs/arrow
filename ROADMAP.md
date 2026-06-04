@@ -5,9 +5,9 @@ Archivo de seguimiento entre sesiones. El **roadmap canónico de fases** vive en
 backlog de ideas que aún no están comprometidas a ninguna fase. Las **convenciones** del proyecto
 están en [CLAUDE.md](CLAUDE.md); el contrato de datos en [SPEC.md](SPEC.md).
 
-> Última actualización: 2026-06-03 (distribución macOS: matrix de CI que publica el `.dmg` arm64+x64
-> en cada release + `install.sh` one-liner `curl … | bash`. Antes: Fase 2 + pulido + mejoras visuales:
-> zoom, titlebar custom, foco por sesión activa, orden de archivos por recencia y tick de reloj).
+> Última actualización: 2026-06-03 (worktree awareness + limpieza por etapas: agrupar worktrees bajo
+> su repo padre + auditoría/limpieza opt-in. Antes: distribución macOS por matrix de CI + `install.sh`;
+> Fase 2 + pulido: zoom, titlebar custom, foco por sesión activa, orden por recencia, tick de reloj).
 
 ## Estado actual
 
@@ -20,7 +20,7 @@ están en [CLAUDE.md](CLAUDE.md); el contrato de datos en [SPEC.md](SPEC.md).
 | 4 — edición + GitHub | ⏳ postergado | Ver README. |
 
 ### Pulido aplicado (post-Fase 2)
-- **Tests del parser**: 19 tests unitarios en `src/lib.rs` (`#[cfg(test)] mod tests`) con
+- **Tests del parser**: 23 tests unitarios (`src/lib.rs` + `src/worktree.rs`, `#[cfg(test)] mod tests`) con
   transcripts-fixture en tempdir. Cubren lo NO obvio: parsing defensivo, solo-top-level, agrupación
   por raíz git, conteo +/-, filtro de `~/.claude/`, orden de repos y de archivos por recencia,
   metadatos, `file_content`. Correr con `cargo test --release`. Complementan a `/verify-parser` (datos reales).
@@ -31,6 +31,39 @@ están en [CLAUDE.md](CLAUDE.md); el contrato de datos en [SPEC.md](SPEC.md).
   `codegen-units=1` + `opt-level="s"` + `panic="abort"`) para reducir el tamaño del bundle.
 - **Skill `/rust-review`**: clippy + rustfmt + checklist de best-practices (ver
   `.claude/skills/rust-review/`).
+
+### Worktrees: awareness + limpieza por etapas (post-Fase 2)
+Perfil objetivo: dev que corre muchos worktrees en paralelo sobre varios proyectos y necesita
+limpiar los mergeados/fantasmas, liberar espacio y mantener orden. Tres capas:
+- **Etapa 0 — detección + agrupación (parser, read-only).** `resolve_git_context` (`src/lib.rs`)
+  distingue `.git` ARCHIVO (worktree) de `.git` CARPETA (repo) por `metadata().is_file()` y, para un
+  worktree, lee `gitdir:` y deriva `name` + `parent_repo` exigiendo el segmento `/worktrees/` (así un
+  **submódulo** —`.git/modules/…`— NO se confunde con worktree). El contrato gana `RepoOut.worktree`
+  (aditivo). La UI (`web/src/lib/worktrees.ts` `groupRepos` + `Sidebar.svelte`) **anida** cada worktree
+  bajo su repo padre con badge de rama, en vez de mostrarlo como repo suelto con nombre aleatorio
+  (resolvía la confusión de “¿por qué arrow abre `wise-plotting-graham`?”). Tests:
+  `detecta_worktree_y_su_repo_padre`, `submodulo_no_se_confunde_con_worktree`, `repo_normal_no_marca_worktree`.
+- **Etapa 1 — auditoría (read-only, capa git/fs SEPARADA y opt-in).** `src/worktree.rs`
+  (`audit_worktrees`) sale del parser puro: usa `git worktree list --porcelain` + `git log`/`merge-base`
+  + `du -sk` + `gh` best-effort. Marca **reclaimable** SOLO con un hecho de git (mergeado a la rama
+  default, en la rama default, PR mergeado, o fantasma podable) — la **antigüedad NO cuenta** (honesto).
+  Paraleliza `du` con `thread::scope` (31s→11s en datos reales). Usa el **working dir descubierto** como
+  `git -C` (no el primer entry del porcelain, que para submódulos es el gitdir interno). Expuesto en CLI
+  (`--worktrees [--json]`), Tauri (`worktrees()`), dev-server (`/api/worktrees`) y panel
+  `WorktreesPanel.svelte` (botón en la topbar; muestra candidatos + tamaño + comando copiable).
+  Verificado en datos reales: 4.4 GB en worktrees, 639 MB reclaimable; clip-hive (8 merged),
+  backoffice (2 merged+PR), escapadas (2 fantasmas).
+- **Etapa 2 — ejecución (opt-in, MUTA disco; única parte que muta).** `remove_worktree`/`prune_worktrees`
+  (`src/worktree.rs`) corren `git worktree remove` **sin `--force`** (git rehúsa con cambios sin
+  commitear) / `git worktree prune`. `remove` no tiene `--dry-run` nativo ⇒ el dry-run reporta el comando
+  sin tocar disco; `prune` usa `-n`. Comandos Tauri (`remove_worktree`/`prune_worktrees`) emiten
+  `report-changed` al terminar. UI: botón **Clean** → dry-run → **confirmación** → ejecutar → re-scan;
+  en el navegador (dev) degrada a “copy cmd” (no exponemos remove/prune por HTTP). Test:
+  `audit_detecta_y_remove_elimina_un_worktree` (repo git temporal real + worktree → remove). 23 tests en total.
+- **Pendientes/notas:** macOS sin GUI verificada en hardware aquí (lib + comandos compilan, tests y
+  dev-server verificados); PR-merged es señal secundaria (en algunos repos pega, en branches de agente
+  no-pusheadas no); la verificación de la auditoría es contra el estado en vivo de git (no del dato del
+  transcript), por diseño.
 
 ### Mejoras visuales / UX (post-Fase 2)
 - **Zoom de la UI** (`Ctrl +` / `Ctrl −` / `Ctrl 0`, estilo VSCode): zoom **nativo** del webview en la

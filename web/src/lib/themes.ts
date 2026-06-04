@@ -1,50 +1,29 @@
-import type { Extension } from '@codemirror/state'
-import {
-  githubDark,
-  githubLight,
-  dracula,
-  tokyoNight,
-  vscodeDark,
-  nord,
-  monokai,
-  materialDark,
-  gruvboxDark,
-  atomone,
-  aura,
-  androidstudio,
-  sublime,
-  solarizedLight,
-} from '@uiw/codemirror-themes-all'
+// Theme METADATA only (id/label/dark) — no CodeMirror theme extensions here, so this
+// module stays tiny and the heavy `@uiw/codemirror-themes-all` bundle is NOT dragged
+// into the entry chunk by the topbar menu. The actual extensions live in `themes-ext.ts`,
+// imported only by the (lazy-loaded) DiffView. See ROADMAP "lazy-load CodeMirror".
 
-export interface ThemeDef {
+export interface ThemeMeta {
   id: string
   label: string
   dark: boolean
-  ext: Extension
 }
 
-// Temas de la comunidad uiw (extensiones CM6 agnósticas del framework).
-export const THEMES: ThemeDef[] = [
-  { id: 'githubDark', label: 'GitHub Dark', dark: true, ext: githubDark },
-  { id: 'dracula', label: 'Dracula', dark: true, ext: dracula },
-  { id: 'tokyoNight', label: 'Tokyo Night', dark: true, ext: tokyoNight },
-  { id: 'vscodeDark', label: 'VS Code Dark', dark: true, ext: vscodeDark },
-  { id: 'nord', label: 'Nord', dark: true, ext: nord },
-  { id: 'monokai', label: 'Monokai', dark: true, ext: monokai },
-  { id: 'materialDark', label: 'Material Dark', dark: true, ext: materialDark },
-  { id: 'gruvboxDark', label: 'Gruvbox Dark', dark: true, ext: gruvboxDark },
-  { id: 'atomone', label: 'Atom One', dark: true, ext: atomone },
-  { id: 'aura', label: 'Aura', dark: true, ext: aura },
-  { id: 'androidstudio', label: 'Android Studio', dark: true, ext: androidstudio },
-  { id: 'sublime', label: 'Sublime', dark: true, ext: sublime },
-  { id: 'githubLight', label: 'GitHub Light', dark: false, ext: githubLight },
-  { id: 'solarizedLight', label: 'Solarized Light', dark: false, ext: solarizedLight },
+export const THEMES: ThemeMeta[] = [
+  { id: 'githubDark', label: 'GitHub Dark', dark: true },
+  { id: 'dracula', label: 'Dracula', dark: true },
+  { id: 'tokyoNight', label: 'Tokyo Night', dark: true },
+  { id: 'vscodeDark', label: 'VS Code Dark', dark: true },
+  { id: 'nord', label: 'Nord', dark: true },
+  { id: 'monokai', label: 'Monokai', dark: true },
+  { id: 'materialDark', label: 'Material Dark', dark: true },
+  { id: 'gruvboxDark', label: 'Gruvbox Dark', dark: true },
+  { id: 'atomone', label: 'Atom One', dark: true },
+  { id: 'aura', label: 'Aura', dark: true },
+  { id: 'androidstudio', label: 'Android Studio', dark: true },
+  { id: 'sublime', label: 'Sublime', dark: true },
+  { id: 'githubLight', label: 'GitHub Light', dark: false },
+  { id: 'solarizedLight', label: 'Solarized Light', dark: false },
 ]
 
 export const DEFAULT_THEME = 'githubDark'
-
-const byId = new Map(THEMES.map((t) => [t.id, t]))
-
-export function themeExt(id: string): Extension {
-  return (byId.get(id) ?? byId.get(DEFAULT_THEME)!).ext
-}

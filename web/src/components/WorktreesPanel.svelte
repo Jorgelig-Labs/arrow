@@ -15,43 +15,70 @@
   let copied = $state<string | null>(null) // path cuyo comando se acaba de copiar
 
   // Etapa 2 (ejecución, solo Tauri): dry-run -> confirmación -> ejecutar -> re-scan.
-  let confirming = $state<string | null>(null) // path en espera de confirmación
-  let dryRun = $state<CleanupResult | null>(null) // preview del dry-run para ese path
-  let busy = $state<string | null>(null) // path con una acción en curso
-  let outcome = $state<Record<string, CleanupResult>>({}) // resultado real por path
+  // Dos tipos de acción: 'remove' (UN worktree, no-fantasma) y 'prune' (a nivel de
+  // REPO: poda TODOS los fantasmas a la vez — `git worktree prune` no es por-fila).
+  type Target =
+    | { kind: 'remove'; repo: string; wt: WorktreeEntry }
+    | { kind: 'prune'; repo: string; paths: string[]; n: number }
 
-  function action(repo: string, wt: WorktreeEntry, dry: boolean): Promise<CleanupResult> {
-    return wt.prunable ? pruneWorktrees(repo, dry) : removeWorktree(repo, wt.path, dry)
+  let confirmKey = $state<string | null>(null) // qué acción espera confirmación
+  let pending = $state<Target | null>(null)
+  let dryRun = $state<CleanupResult | null>(null) // preview del dry-run
+  let busy = $state<string | null>(null) // key de la acción en curso
+  let outcome = $state<Record<string, CleanupResult>>({}) // resultado por path
+
+  // Una acción 'prune' afecta a todos los fantasmas del repo, así que su key es por
+  // repo (no por fila); 'remove' es por worktree.
+  function targetKey(t: Target): string {
+    return t.kind === 'remove' ? t.wt.path : 'prune:' + t.repo
+  }
+  function run(t: Target, dry: boolean): Promise<CleanupResult> {
+    return t.kind === 'remove' ? removeWorktree(t.repo, t.wt.path, dry) : pruneWorktrees(t.repo, dry)
+  }
+  // Marca el resultado en TODOS los paths afectados (1 para remove, N para prune) para
+  // que la desaparición tras el re-scan quede explicada por fila.
+  function mark(t: Target, res: CleanupResult) {
+    const o = { ...outcome }
+    const paths = t.kind === 'remove' ? [t.wt.path] : t.paths
+    for (const p of paths) o[p] = res
+    outcome = o
   }
 
-  async function startClean(repo: string, wt: WorktreeEntry) {
-    busy = wt.path
+  async function startClean(t: Target) {
+    const k = targetKey(t)
+    busy = k
     try {
-      dryRun = await action(repo, wt, true) // preview, no toca disco
-      confirming = wt.path
+      dryRun = await run(t, true) // preview, no toca disco
+      pending = t
+      confirmKey = k
     } catch (e) {
-      outcome = { ...outcome, [wt.path]: { ok: false, dryRun: true, command: wt.command, output: String(e) } }
+      mark(t, { ok: false, dryRun: true, command: '', output: String(e) })
     } finally {
       busy = null
     }
   }
 
-  async function confirmClean(repo: string, wt: WorktreeEntry) {
-    busy = wt.path
-    confirming = null
+  async function confirmClean() {
+    const t = pending
+    if (!t) return
+    const k = targetKey(t)
+    busy = k
+    confirmKey = null
     try {
-      const res = await action(repo, wt, false)
-      outcome = { ...outcome, [wt.path]: res }
-      if (res.ok) await load(withSizes) // re-scan: el worktree eliminado desaparece
+      const res = await run(t, false)
+      mark(t, res)
+      if (res.ok) await load(withSizes) // re-scan: lo limpiado desaparece
     } catch (e) {
-      outcome = { ...outcome, [wt.path]: { ok: false, dryRun: false, command: wt.command, output: String(e) } }
+      mark(t, { ok: false, dryRun: false, command: '', output: String(e) })
     } finally {
       busy = null
+      pending = null
     }
   }
 
   function cancelClean() {
-    confirming = null
+    confirmKey = null
+    pending = null
     dryRun = null
   }
 
@@ -171,6 +198,8 @@
           {/if}
         </div>
         {#each audit.repos as repo}
+          {@const phantoms = repo.worktrees.filter((w) => w.prunable)}
+          {@const pruneKey = 'prune:' + repo.parentRepo}
           <section class="repo">
             <div class="repo-head">
               <span class="repo-name">{basename(repo.parentRepo)}</span>
@@ -178,11 +207,38 @@
               <span class="repo-meta">
                 {repo.worktrees.length} wt{#if withSizes} · {humanKb(repo.totalKb)}{#if repo.reclaimableKb > 0} · <span class="safe-text">{humanKb(repo.reclaimableKb)} reclaimable</span>{/if}{/if}
               </span>
+              <!-- Prune is repo-wide (`git worktree prune` clears ALL phantoms at once),
+                   so it's ONE repo-level action, not a per-row button. -->
+              {#if inTauri && phantoms.length}
+                <button
+                  class="clean"
+                  disabled={busy === pruneKey}
+                  onclick={() => startClean({ kind: 'prune', repo: repo.parentRepo, paths: phantoms.map((p) => p.path), n: phantoms.length })}
+                >
+                  {busy === pruneKey ? '…' : `Prune ${phantoms.length} phantom${phantoms.length > 1 ? 's' : ''}`}
+                </button>
+              {/if}
             </div>
+
+            {#if confirmKey === pruneKey}
+              <div class="confirm">
+                <code>{dryRun?.command}</code>
+                <p class="confirm-note">
+                  Prunes <strong>all {phantoms.length}</strong> phantom worktree entries in this repo
+                  (their directories are already gone). Removes only the stale git bookkeeping.
+                </p>
+                <div class="confirm-actions">
+                  <button class="danger" onclick={confirmClean}>Prune {phantoms.length}</button>
+                  <button class="cancel" onclick={cancelClean}>Cancel</button>
+                </div>
+              </div>
+            {/if}
+
             {#each repo.worktrees as wt}
               {@const done = outcome[wt.path]}
+              {@const gone = done?.ok && !done.dryRun}
               <div class="wt-block">
-                <div class="wt" class:reclaimable={wt.reclaimable} class:removed={done?.ok && !done.dryRun}>
+                <div class="wt" class:reclaimable={wt.reclaimable} class:removed={gone}>
                   <i class="dot {dotClass(wt)}"></i>
                   <span class="wt-name" title={wt.path}>{wt.name}</span>
                   <span class="wt-branch">{wt.branch ?? '(detached)'}</span>
@@ -190,7 +246,9 @@
                   {#if wt.reasons.length}
                     <span class="reasons">{wt.reasons.join(' · ')}</span>
                   {/if}
-                  {#if wt.reclaimable && !(done?.ok && !done.dryRun)}
+                  <!-- Per-row action: only REMOVE of a non-phantom reclaimable worktree.
+                       Phantoms are handled by the repo-level Prune above. -->
+                  {#if wt.reclaimable && !wt.prunable && !gone}
                     <button class="copy" onclick={() => copyCmd(wt)} title={wt.command}>
                       {copied === wt.path ? 'copied' : 'copy cmd'}
                     </button>
@@ -198,26 +256,29 @@
                       <button
                         class="clean"
                         disabled={busy === wt.path}
-                        onclick={() => startClean(repo.parentRepo, wt)}
+                        onclick={() => startClean({ kind: 'remove', repo: repo.parentRepo, wt })}
                       >
-                        {busy === wt.path ? '…' : 'Clean'}
+                        {busy === wt.path ? '…' : 'Remove'}
                       </button>
+                    {:else}
+                      <!-- browser: read-only, copy only -->
                     {/if}
+                  {:else if wt.prunable && !inTauri}
+                    <button class="copy" onclick={() => copyCmd(wt)} title={wt.command}>
+                      {copied === wt.path ? 'copied' : 'copy cmd'}
+                    </button>
                   {/if}
                 </div>
 
-                {#if confirming === wt.path}
+                {#if confirmKey === wt.path}
                   <div class="confirm">
                     <code>{dryRun?.command}</code>
                     <p class="confirm-note">
-                      {wt.prunable
-                        ? 'Prunes phantom worktree entries (their directories are gone).'
-                        : `Removes this worktree (~${humanKb(wt.sizeKb)}). No --force: git refuses if there are uncommitted or untracked changes.`}
+                      Removes this worktree{#if withSizes && wt.sizeKb} (~{humanKb(wt.sizeKb)}){/if}.
+                      No <code>--force</code>: git refuses if there are uncommitted or untracked changes.
                     </p>
                     <div class="confirm-actions">
-                      <button class="danger" onclick={() => confirmClean(repo.parentRepo, wt)}>
-                        {wt.prunable ? 'Prune' : 'Remove'}
-                      </button>
+                      <button class="danger" onclick={confirmClean}>Remove</button>
                       <button class="cancel" onclick={cancelClean}>Cancel</button>
                     </div>
                   </div>
@@ -225,7 +286,7 @@
 
                 {#if done}
                   <div class="result" class:bad={!done.ok}>
-                    {#if done.ok && !done.dryRun}✓ removed{:else if !done.ok}✕ {done.output}{/if}
+                    {#if gone}✓ {wt.prunable ? 'pruned' : 'removed'}{:else if !done.ok}✕ {done.output}{/if}
                   </div>
                 {/if}
               </div>
@@ -234,12 +295,12 @@
         {/each}
         <p class="foot dim">
           {#if inTauri}
-            Remove runs <code>git worktree remove</code> behind a dry-run + confirmation.
+            Remove/prune run behind a dry-run + confirmation.
           {:else}
             Read-only here — copy the command to run it yourself.
           {/if}
-          “Reclaimable” = merged into the default branch, on the default branch, a merged PR, or a
-          prunable phantom entry — never mere staleness.
+          “Reclaimable” = on the default branch, no commits beyond the default branch, or a prunable
+          phantom — never mere staleness, and never a locked worktree.
           {#if !withSizes}Sizes not measured yet — use “Calculate sizes”.{/if}
         </p>
       {/if}

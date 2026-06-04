@@ -16,7 +16,7 @@ opening an IDE, without AI chat, and **without depending on git or hooks**.
 > Status: **Phase 2 complete + polish — released on Linux
 > ([v0.1.3](https://github.com/MrArcher23/arrow/releases/latest))**. A desktop app (Tauri 2.x) with
 > the Rust parser as its native backend, **already usable day to day** on Linux (`.deb` + AppImage).
-> Phases 0 (parser/CLI), 1 (web UI) and 2 (packaging) are complete; since then: 23 parser tests, a
+> Phases 0 (parser/CLI), 1 (web UI) and 2 (packaging) are complete; since then: 24 parser tests, a
 > resilient watcher, zoom, a custom titlebar, active-session focus, live diff-panel refresh, files
 > ordered by most-recent edit (with relative times that age in place via a clock tick), macOS
 > adaptation, and a robust diff-"before" reconstruction (shows a real diff even on Claude Code's
@@ -213,7 +213,7 @@ cargo tauri build
 The parser lives in a **library** (`src/lib.rs`): pure functions `build_report(projects_dir)` and
 `file_content(projects_dir, file, session)` + the serializable structs. Two frontends consume it:
 `src/main.rs` (the CLI, with flags intact) and `src-tauri/` (the desktop backend). Zero duplicated
-logic; the same source of truth for terminal, web, and native app. The parser ships **23 unit tests**
+logic; the same source of truth for terminal, web, and native app. The parser ships **24 unit tests**
 (`cargo test`) over fixture transcripts in a tempdir, covering the non-obvious parts: defensive
 parsing, top-level transcripts only, grouping by git root, `+/−` counting, filtering of
 `~/.claude/`, recency ordering (repos, sessions, and files within a session), the diff-"before" reconstruction cascade (inline `originalFile`,

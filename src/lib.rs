@@ -188,20 +188,75 @@ pub fn build_report(projects_dir: &str) -> ReportOut {
 /// root, de-duplicated; `git worktree list` then enumerates ALL their worktrees,
 /// even ones Claude never edited.
 pub fn worktree_audit(projects_dir: &str, include_sizes: bool) -> WorktreeAudit {
-    let report = build_report(projects_dir);
+    worktree::audit_worktrees(&collect_repo_roots(projects_dir), include_sizes)
+}
+
+/// Distinct git repo roots that Claude edited in, WITHOUT building the full report.
+/// `worktree_audit` only needs the repo roots (to enumerate their worktrees), so this
+/// skips file/hunk accumulation and report assembly entirely — the audit no longer
+/// re-parses the whole corpus on every panel open. A worktree's root is its parent
+/// repo (so all its worktrees collapse under one entry), matching `build_report`.
+pub fn collect_repo_roots(projects_dir: &str) -> Vec<String> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let claude_home = format!("{home}/.claude/");
+    let projects_path = Path::new(projects_dir);
+    let mut cache: HashMap<String, GitContext> = HashMap::new();
     let mut seen = std::collections::HashSet::new();
     let mut roots: Vec<String> = Vec::new();
-    for r in &report.repos {
-        let root = r
-            .worktree
-            .as_ref()
-            .and_then(|w| w.parent_repo.clone())
-            .unwrap_or_else(|| r.cwd.clone());
-        if seen.insert(root.clone()) {
-            roots.push(root);
+
+    for entry in WalkDir::new(projects_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+        if !path.extension().map(|e| e == "jsonl").unwrap_or(false) {
+            continue;
+        }
+        // Top-level transcripts only (same rule as `collect`).
+        let top_level = path
+            .strip_prefix(projects_path)
+            .map(|r| r.components().count() == 2)
+            .unwrap_or(false);
+        if !top_level {
+            continue;
+        }
+        let file = match File::open(path) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let v: Value = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(_) => continue, // defensive: skip malformed lines
+            };
+            // Only records that represent an Edit/Write/MultiEdit (top-level filePath),
+            // and skip Claude's global home — same filter as `ingest`.
+            let file_path = match v
+                .get("toolUseResult")
+                .and_then(|t| t.get("filePath"))
+                .and_then(Value::as_str)
+            {
+                Some(s) => s,
+                None => continue,
+            };
+            if file_path.starts_with(&claude_home) {
+                continue;
+            }
+            let cwd = v
+                .get("cwd")
+                .and_then(Value::as_str)
+                .unwrap_or("(cwd desconocido)");
+            let ctx = resolve_git_context(cwd, &mut cache);
+            let root = ctx.worktree.and_then(|w| w.parent_repo).unwrap_or(ctx.root);
+            if seen.insert(root.clone()) {
+                roots.push(root);
+            }
         }
     }
-    worktree::audit_worktrees(&roots, include_sizes)
+    roots
 }
 
 /// One target edit captured during a session scan: the inline `originalFile`

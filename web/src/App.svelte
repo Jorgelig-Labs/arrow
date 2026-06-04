@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import Sidebar from './components/Sidebar.svelte'
-  import DiffView from './components/DiffView.svelte'
+  // DiffView (CodeMirror core + merge + search + all themes, the ~463KB chunk) is loaded
+  // lazily on first file selection, so the sidebar boots without it. See loadDiffView().
   import ThemeMenu from './components/ThemeMenu.svelte'
   import WindowControls from './components/WindowControls.svelte'
   import WorktreesPanel from './components/WorktreesPanel.svelte'
@@ -19,7 +20,14 @@
   let loadingContent = $state(false)
   // Bound to the DiffView instance so the global Ctrl+F can open its find panel.
   let diffView = $state<{ openSearch: () => void }>()
+  // Lazily-imported DiffView component (kept off the boot path). Loaded on first select().
+  let DiffViewComp = $state<typeof import('./components/DiffView.svelte').default | null>(null)
   let selected = $state<{ session: string; path: string } | null>(null)
+
+  async function loadDiffView() {
+    if (DiffViewComp) return
+    DiffViewComp = (await import('./components/DiffView.svelte')).default
+  }
   let theme = $state(localStorage.getItem('arrow.theme') ?? DEFAULT_THEME)
   let showWorktrees = $state(false) // panel de higiene de worktrees (bajo demanda)
 
@@ -220,8 +228,12 @@
     selected = { session, path }
     content = null
     loadingContent = true
+    // Kick off the DiffView import in parallel with the content fetch (both awaited
+    // by the time the editor renders); after the first open it's a no-op.
+    const editor = loadDiffView()
     try {
       content = await loadContent(path, session)
+      await editor
     } catch (e) {
       error = String(e)
     } finally {
@@ -307,7 +319,11 @@
         </div>
       {/if}
       <div class="diff-area">
-        <DiffView bind:this={diffView} {content} loading={loadingContent} themeId={theme} />
+        {#if DiffViewComp}
+          <DiffViewComp bind:this={diffView} {content} loading={loadingContent} themeId={theme} />
+        {:else if selected}
+          <div class="loading">Loading editor…</div>
+        {/if}
       </div>
     </main>
   </div>

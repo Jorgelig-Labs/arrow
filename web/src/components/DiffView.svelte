@@ -7,7 +7,7 @@
   import { EditorState, StateField, StateEffect } from '@codemirror/state'
   import type { Extension, Range } from '@codemirror/state'
   import type { FileContent } from '../lib/types'
-  import { themeExt } from '../lib/themes'
+  import { themeExt } from '../lib/themes-ext'
   import { resolveLanguage } from '../lib/highlight'
 
   interface Props {

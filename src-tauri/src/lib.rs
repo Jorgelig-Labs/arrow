@@ -26,15 +26,23 @@ fn projects_dir() -> String {
 }
 
 /// Reporte completo repo→sesión→archivo (sin filtros). Contrato idéntico a `--json`.
+/// `async` + `spawn_blocking`: el parseo del corpus es pesado, así que NO debe correr
+/// en el hilo del runtime (si no, atasca la entrega del evento `report-changed`).
 #[tauri::command]
-fn report() -> ReportOut {
-    arrow::build_report(&projects_dir())
+async fn report() -> ReportOut {
+    tauri::async_runtime::spawn_blocking(|| arrow::build_report(&projects_dir()))
+        .await
+        .expect("report task panicked")
 }
 
 /// Before/after de un archivo para la vista de diff. Idéntico a `--content --file`.
 #[tauri::command]
-fn content(file: String, session: Option<String>) -> ContentOut {
-    arrow::file_content(&projects_dir(), &file, session.as_deref())
+async fn content(file: String, session: Option<String>) -> ContentOut {
+    tauri::async_runtime::spawn_blocking(move || {
+        arrow::file_content(&projects_dir(), &file, session.as_deref())
+    })
+    .await
+    .expect("content task panicked")
 }
 
 /// Worktree hygiene audit (Stage 1, read-only). Idéntico a `--worktrees --json`.
@@ -44,12 +52,14 @@ fn content(file: String, session: Option<String>) -> ContentOut {
 async fn worktrees(include_sizes: bool) -> WorktreeAudit {
     // Off the main thread: the audit blocks on git/du subprocesses. `include_sizes`
     // false = fast git-only scan (no multi-GB `du`), so opening the panel never hangs.
-    tauri::async_runtime::spawn_blocking(move || arrow::worktree_audit(&projects_dir(), include_sizes))
-        .await
-        .unwrap_or(WorktreeAudit {
-            repos: Vec::new(),
-            gh_available: false,
-        })
+    tauri::async_runtime::spawn_blocking(move || {
+        arrow::worktree_audit(&projects_dir(), include_sizes)
+    })
+    .await
+    .unwrap_or(WorktreeAudit {
+        repos: Vec::new(),
+        gh_available: false,
+    })
 }
 
 /// Stage 2 (mutating): remove a worktree via `git worktree remove` (no `--force`).

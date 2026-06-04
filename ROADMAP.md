@@ -20,7 +20,7 @@ están en [CLAUDE.md](CLAUDE.md); el contrato de datos en [SPEC.md](SPEC.md).
 | 4 — edición + GitHub | ⏳ postergado | Ver README. |
 
 ### Pulido aplicado (post-Fase 2)
-- **Tests del parser**: 23 tests unitarios (`src/lib.rs` + `src/worktree.rs`, `#[cfg(test)] mod tests`) con
+- **Tests del parser**: 24 tests unitarios (`src/lib.rs` + `src/worktree.rs`, `#[cfg(test)] mod tests`) con
   transcripts-fixture en tempdir. Cubren lo NO obvio: parsing defensivo, solo-top-level, agrupación
   por raíz git, conteo +/-, filtro de `~/.claude/`, orden de repos y de archivos por recencia,
   metadatos, `file_content`. Correr con `cargo test --release`. Complementan a `/verify-parser` (datos reales).
@@ -59,7 +59,32 @@ limpiar los mergeados/fantasmas, liberar espacio y mantener orden. Tres capas:
   sin tocar disco; `prune` usa `-n`. Comandos Tauri (`remove_worktree`/`prune_worktrees`) emiten
   `report-changed` al terminar. UI: botón **Clean** → dry-run → **confirmación** → ejecutar → re-scan;
   en el navegador (dev) degrada a “copy cmd” (no exponemos remove/prune por HTTP). Test:
-  `audit_detecta_y_remove_elimina_un_worktree` (repo git temporal real + worktree → remove). 23 tests en total.
+  `audit_detecta_y_remove_elimina_un_worktree` (repo git temporal real + worktree → remove). 24 tests en total.
+
+### Endurecimiento por auditoría multi-agente (post-worktrees)
+Una auditoría de 15 agentes (5 módulos × 3 lentes: correctitud, perf Rust, footprint) sobre la feature
+de worktrees produjo 3 frentes de mejora, todos aplicados:
+- **Honestidad (lo más grave).** El audit overprometía "seguro de borrar": (a) un worktree **en la rama
+  default / sin divergir** ahora dice "on default branch" / "no commits beyond <default>" (no falso
+  "merged"); (b) un worktree **locked** ya NO es reclaimable (git `worktree remove` sin `--force` lo
+  rechaza) — esto atrapó un bug real: 8 worktrees de `clip-hive` bloqueados por agentes ACTIVOS que
+  arrow habría dicho "elimínalos"; (c) `prunable` se decide **solo por el flag de git**, no por
+  `Path::exists()` (un disco desmontado ya no se confunde con fantasma); (d) el **Prune** del panel es
+  ahora **a nivel de repo** ("Prune N phantoms", marca todos), no por-fila silencioso; (e) `pr_merged`
+  es **advisory** (no reclaimable por sí solo); (f) comandos **shell-quoted**; (g) `strip_prefix`
+  para `refs/heads/` y `origin/` (ramas con slash). Tests: `honestidad_reclaimable_solo_lo_seguro`.
+- **Performance.** (1) `worktree_audit` ya NO re-corre `build_report` completo: nuevo
+  `collect_repo_roots` (solo raíces, sin diff/hunks). (2) Fan-out **acotado** (`bounded_map`,
+  ≤cores≤8, `catch_unwind` por item) en vez de un hilo por worktree (el `du`-thrash era el
+  congelamiento). (3) Fase 1 (`gh` + default branch) **paralela**; se quitó el probe `gh auth status`
+  (se deriva del éxito de la llamada). (4) `report()`/`content()` de Tauri pasan a `async` +
+  `spawn_blocking`. Resultado real: escaneo completo **~10s → ~3.3s**; el rápido sigue ~2s.
+- **Footprint (arranque).** **Lazy-load de CodeMirror**: `DiffView` se importa dinámicamente al abrir
+  el primer archivo, y los themes se parten en metadata (`themes.ts`) vs extensiones pesadas
+  (`themes-ext.ts`, solo en el chunk de DiffView). El **entry de boot bajó de ~463 KB a ~76 KB**.
+  **Nota honesta:** esto NO baja el piso de ~200 MB de RAM (es el WKWebView del sistema) — es solo
+  arranque/TTI/bundle; la única palanca que cruzaría ese piso (servir en navegador, sin webview) se
+  **descartó** porque la ventana nativa Mac/Linux/Windows es innegociable.
 - **Pendientes/notas:** macOS sin GUI verificada en hardware aquí (lib + comandos compilan, tests y
   dev-server verificados); PR-merged es señal secundaria (en algunos repos pega, en branches de agente
   no-pusheadas no); la verificación de la auditoría es contra el estado en vivo de git (no del dato del

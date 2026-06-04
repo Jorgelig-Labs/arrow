@@ -69,10 +69,11 @@ export interface WorktreeEntry {
   branch: string | null
   lastCommit: string | null // ISO 8601
   ageDays: number | null
-  merged: boolean // ancestro de la rama default (chequeo local)
+  merged: boolean // head contenido en la rama default (chequeo local)
   onDefault: boolean // está en la rama default
-  prMerged: boolean | null // gh: PR mergeado para esta rama (best-effort)
-  prunable: boolean // git lo marca (su directorio ya no existe)
+  prMerged: boolean | null // gh: PR mergeado para esta rama (advisory, best-effort)
+  prunable: boolean // git lo marca (su gitdir no apunta a nada)
+  locked: boolean // git worktree remove (sin --force) lo rechazaría
   stale: boolean // ageDays > umbral
   sizeKb: number | null
   reasons: string[] // por qué se lista (honesto)
